@@ -50,25 +50,51 @@ class _WrappedCLIPTower(nn.Module):
         self.last_kept_idx: torch.Tensor | None = None
         self.last_salience: torch.Tensor | None = None
 
+    @torch.no_grad()
     def forward(self, images: torch.Tensor):
-        # Expect inner.forward to return (hidden_states, attn_list)
-        hs, attns = self.inner(images)
-        # hs:    (B, S+1, D)  — CLS at index 0 for LLaVA-1.5 CLIP
-        # attns: list of (B, H, S+1, S+1)
-        attn = attns[self.config.salience_layer_idx]
+        # The inner LLaVA CLIPVisionTower.forward returns only image_features
+        # (a single tensor), so we cannot get attentions from it. Reach into
+        # the underlying HF CLIPVisionModel and request both hidden_states and
+        # attentions, then mimic LLaVA's feature_select so that downstream
+        # behaviour matches the vanilla path when encoder_prune_ratio == 0.
+        if isinstance(images, list):
+            raise NotImplementedError(
+                "List-of-images input is not supported by the SparseVILA wrapper yet"
+            )
+        vm = self.inner.vision_tower    # HF CLIPVisionModel
+        outs = vm(
+            images.to(device=self.inner.device, dtype=self.inner.dtype),
+            output_hidden_states=True,
+            output_attentions=True,
+        )
+        # Hidden states: pick LLaVA's chosen layer (typically -2). Drop CLS for
+        # "patch" feature mode (the LLaVA-1.5 default).
+        hs_full = outs.hidden_states[self.inner.select_layer]
+        if self.inner.select_feature == "patch":
+            hs_patches = hs_full[:, 1:, :]
+        elif self.inner.select_feature == "cls_patch":
+            hs_patches = hs_full
+        else:
+            raise ValueError(
+                f"Unexpected select_feature: {self.inner.select_feature}"
+            )
+        hs_patches = hs_patches.to(images.dtype)
+
+        # Attention for salience: configured layer (default last).
+        attn = outs.attentions[self.config.salience_layer_idx]
         salience = compute_salience_from_attn(
             attn, strategy=self.config.salience_strategy,
         )
-        patches = hs[:, 1:, :]      # strip CLS
+
         pruned, kept_idx = prune_visual_tokens(
-            patches, salience, ratio=self.config.encoder_prune_ratio
+            hs_patches, salience, ratio=self.config.encoder_prune_ratio,
         )
         self.last_kept_idx = kept_idx
         self.last_salience = salience
         if self.compat_mode:
             return pruned
         return EncoderSalienceOutput(
-            pruned_hidden=pruned, kept_idx=kept_idx, salience=salience
+            pruned_hidden=pruned, kept_idx=kept_idx, salience=salience,
         )
 
 

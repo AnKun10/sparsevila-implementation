@@ -10,10 +10,14 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
     "torch>=2.1",
-    "transformers>=4.40,<4.50",
+    # Pinned to LLaVA-1.5's expected version (third_party/LLaVA/pyproject.toml).
+    # Newer transformers (4.40+) break LLaVA's pre-4.38-era forward signature
+    # via cache_position and stricter _validate_model_kwargs.
+    "transformers==4.37.2",
+    "tokenizers==0.15.1",
     "Pillow",
     "sentencepiece",
-    "accelerate>=0.27",
+    "accelerate>=0.21,<1.0",
     "einops",
     "numpy",
 ]

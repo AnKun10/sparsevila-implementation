@@ -1,41 +1,69 @@
 """Tests for LlavaFifteenAdapter.wrap_encoder + EncoderSalienceOutput.
 
-The fake attention is designed so two patch tokens have non-zero salience,
-ensuring prune_visual_tokens (quantile strategy) keeps exactly 2 of 4 with
-ratio=0.5.
+The fake CLIPVisionTower mimics the minimum surface that the wrapper actually
+reaches into:
+  - .vision_tower(images, output_hidden_states=True, output_attentions=True)
+    returning a BaseModelOutput-like with .hidden_states and .attentions tuples
+  - .select_layer (int, e.g. -2)
+  - .select_feature ("patch" or "cls_patch")
+  - .dtype / .device properties
 
-Adapted from the task spec: original spec used only one hot patch
-(attn[..., 0, 3] = 1.0), which with strategy="cls" yields salience
-[0, 0, 1, 0]. quantile(0.5) = 0, keep_mask = salience > 0 → only 1 token
-kept, contradicting the numel()==2 assertion. Fix (Option 1): set two patches
-with non-zero attention so salience has two non-zero entries; quantile(0.5)
-then lies strictly between 0 and the peak, keeping exactly 2 tokens.
+With ratio=0.5 and CLS-row attention [0, 0.4, 0.6, 0] over 4 patch keys, the
+quantile threshold is 0.2 and the wrapper keeps patches 1 and 2.
 """
+from types import SimpleNamespace
 import torch
-import pytest
+
 from sparsevila.config import SparseVILAConfig
 from sparsevila.models.llava_15 import LlavaFifteenAdapter, EncoderSalienceOutput
 
 
+class _FakeHFCLIPVisionModel(torch.nn.Module):
+    """Minimal stand-in for transformers.CLIPVisionModel."""
+
+    def __init__(self, num_patches: int = 4, hidden_size: int = 8, num_heads: int = 1):
+        super().__init__()
+        self.num_patches = num_patches
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        # Single dummy parameter so .to(...) / .dtype / .device work
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, images, output_hidden_states=False, output_attentions=False):
+        b = images.shape[0]
+        S1 = self.num_patches + 1  # +1 for CLS
+
+        # Two hidden state tensors so [-2] is the penultimate layer (LLaVA default).
+        hs_penult = torch.randn(b, S1, self.hidden_size)
+        hs_last = torch.randn(b, S1, self.hidden_size)
+
+        # One attention map; CLS (row 0) attends two patches non-zero.
+        attn = torch.zeros(b, self.num_heads, S1, S1)
+        attn[..., 0, 2] = 0.4   # CLS -> patch 1
+        attn[..., 0, 3] = 0.6   # CLS -> patch 2
+
+        return SimpleNamespace(
+            hidden_states=(hs_penult, hs_last) if output_hidden_states else None,
+            attentions=(attn,) if output_attentions else None,
+        )
+
+
 class _FakeCLIPTower(torch.nn.Module):
-    """Mimics LLaVA CLIPVisionTower minimally."""
+    """Mimics LLaVA CLIPVisionTower surface used by the wrapper."""
+
     def __init__(self):
         super().__init__()
-        self.hidden_size = 8
-        self.num_patches = 4   # 2x2 patches for the test
+        self.vision_tower = _FakeHFCLIPVisionModel()
+        self.select_layer = -2
+        self.select_feature = "patch"
 
-    def forward(self, images):
-        # Return hidden_states (B, S+1, D) with CLS at 0
-        b = images.shape[0]
-        hs = torch.randn(b, self.num_patches + 1, self.hidden_size)
-        # Fake attention of shape (B, H=1, S+1, S+1)
-        # Two patches get non-zero CLS attention so salience has two
-        # non-zero entries.  With ratio=0.5 and salience=[0, 0.4, 0.6, 0],
-        # quantile(0.5)=0.2, keep_mask = salience>0.2 → patches 1 and 2 kept.
-        attn = torch.zeros(b, 1, self.num_patches + 1, self.num_patches + 1)
-        attn[..., 0, 2] = 0.4   # CLS -> patch 1 (attn col index 2 = patch idx 1)
-        attn[..., 0, 3] = 0.6   # CLS -> patch 2 (attn col index 3 = patch idx 2)
-        return hs, [attn]        # (hidden_states, [attn per layer])
+    @property
+    def dtype(self):
+        return self.vision_tower.weight.dtype
+
+    @property
+    def device(self):
+        return self.vision_tower.weight.device
 
 
 def test_wrap_encoder_returns_salience_output():
@@ -47,12 +75,9 @@ def test_wrap_encoder_returns_salience_output():
     wrapped.compat_mode = False
     out = wrapped(images)
     assert isinstance(out, EncoderSalienceOutput)
-    # All 4 patches present in salience score vector
     assert out.salience.shape == (4,)
-    # Pruning: keep 2 of 4
     assert out.pruned_hidden.shape == (1, 2, 8)
     assert out.kept_idx.numel() == 2
-    # The patch with the highest signal (idx 2) should be kept
     assert 2 in out.kept_idx.tolist()
 
 
@@ -64,6 +89,5 @@ def test_wrap_encoder_zero_ratio_bypasses():
     images = torch.randn(1, 3, 16, 16)
     wrapped.compat_mode = False
     out = wrapped(images)
-    # No tokens pruned
     assert out.pruned_hidden.shape == (1, 4, 8)
     assert out.kept_idx.numel() == 4

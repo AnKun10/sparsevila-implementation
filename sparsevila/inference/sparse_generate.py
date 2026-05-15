@@ -62,10 +62,26 @@ def _install_sparse_attention_bias(model, sparse_bias: torch.Tensor):
     def make_hook():
         def hook(module, args, kwargs):
             am = kwargs.get("attention_mask", None)
+            # Determine the kv_len for this call. When SDPA's fast path
+            # drops the mask (am is None), reconstruct it from
+            # hidden_states + past_key_value so we still get to inject the
+            # sparse bias.
             if am is None:
-                return None
-            kv_len = am.shape[-1]
-            kwargs["attention_mask"] = am + sparse_bias[..., :kv_len].to(am.dtype)
+                hidden_states = args[0] if args else kwargs.get("hidden_states")
+                q_len = hidden_states.shape[1]
+                past_kv = kwargs.get("past_key_value", None)
+                past_len = 0
+                if past_kv is not None and getattr(past_kv, "key_cache", None):
+                    layer_idx = getattr(module, "layer_idx", 0)
+                    if layer_idx < len(past_kv.key_cache):
+                        past_len = past_kv.key_cache[layer_idx].shape[-2]
+                kv_len = past_len + q_len
+                dtype = hidden_states.dtype
+                new_am = sparse_bias[..., :kv_len].to(dtype).expand(1, 1, q_len, kv_len).clone()
+            else:
+                kv_len = am.shape[-1]
+                new_am = am + sparse_bias[..., :kv_len].to(am.dtype)
+            kwargs["attention_mask"] = new_am
             return args, kwargs
         return hook
 

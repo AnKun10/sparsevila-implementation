@@ -30,3 +30,19 @@ def test_invalid_strategy_raises():
 def test_invalid_aggregation_raises():
     with pytest.raises(ValueError, match="decode_head_aggregation"):
         SparseVILAConfig(decode_head_aggregation="median")
+
+
+def test_default_quant_is_none():
+    assert SparseVILAConfig().quantize_llm == "none"
+
+
+def test_valid_quant_values():
+    for v in ("none", "4bit-bnb", "8bit-bnb"):
+        assert SparseVILAConfig(quantize_llm=v).quantize_llm == v
+
+
+def test_invalid_quant_raises():
+    with pytest.raises(ValueError, match="quantize_llm"):
+        SparseVILAConfig(quantize_llm="int4-awq")
+    with pytest.raises(ValueError, match="quantize_llm"):
+        SparseVILAConfig(quantize_llm="fp8")

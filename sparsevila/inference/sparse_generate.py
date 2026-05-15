@@ -58,9 +58,37 @@ import torch
 from ..cache.sparse_cache import SparseCache
 from ..retrieval.packed_kv import PackedKV
 from ..rope.unified_rope import rerotate_keys
+from .decode_salience import (
+    per_layer_salience_from_attn_maps,
+    per_layer_salience_via_flash_kernel,
+)
 
 
 IMAGE_TOKEN_INDEX = -200    # LLaVA constant
+
+
+def _compute_decode_salience(
+    model, prefill_out, full_cache, q_start, q_end, v_start, v_end,
+    use_flash_kernel: bool,
+):
+    """Dispatch decode salience to either the flash path or the attn-map path.
+
+    Returns a list of per-layer salience tensors of shape ``(V,)``.
+    """
+    if use_flash_kernel:
+        return per_layer_salience_via_flash_kernel(
+            model=model,
+            hidden_states_per_layer=prefill_out.hidden_states,
+            cache=full_cache,
+            q_start=q_start, q_end=q_end,
+            v_start=v_start, v_end=v_end,
+            use_flash=True,
+        )
+    return per_layer_salience_from_attn_maps(
+        attentions=prefill_out.attentions,
+        q_start=q_start, q_end=q_end,
+        v_start=v_start, v_end=v_end,
+    )
 
 
 @contextmanager
@@ -126,10 +154,17 @@ def sparse_generate(
     decode_retrieval_ratio: float = 0.0,
     max_new_tokens: int = 80,
     eos_token_id: Optional[int] = None,
+    use_flash_kernel: bool = True,
 ) -> torch.Tensor:
     """Greedy SparseVILA generation for LLaVA-1.5 single-image, batch=1.
 
     Returns only the *generated* tokens (excludes the prompt).
+
+    When ``use_flash_kernel=True`` (default), decode salience is computed via
+    :func:`~sparsevila.inference.decode_salience.per_layer_salience_via_flash_kernel`,
+    avoiding the dense ``(L, L)`` attention map allocation in prefill. Set
+    False to fall back to the simpler ``output_attentions=True`` path for
+    debugging or numerical-equivalence comparison.
     """
     if input_ids.ndim != 2 or input_ids.shape[0] != 1:
         raise NotImplementedError("v1 supports batch_size=1 only")
@@ -156,7 +191,8 @@ def sparse_generate(
         images=images,
         past_key_values=cache,
         use_cache=True,
-        output_attentions=need_retrieval,
+        output_attentions=(need_retrieval and not use_flash_kernel),
+        output_hidden_states=(need_retrieval and use_flash_kernel),
         return_dict=True,
     )
     cache = prefill_out.past_key_values
@@ -176,11 +212,13 @@ def sparse_generate(
         q_start, q_end = v_end, full_len
         keep_count = max(1, int(round((1.0 - decode_retrieval_ratio) * K_visual)))
 
+        sal_per_layer = _compute_decode_salience(
+            model, prefill_out, cache, q_start, q_end, v_start, v_end,
+            use_flash_kernel=use_flash_kernel,
+        )
+
         sparse_biases: List[torch.Tensor] = []
-        for layer_attn in prefill_out.attentions:
-            # layer_attn: (1, H, L, L); take Q -> visual_K slice
-            contrib = layer_attn[:, :, q_start:q_end, v_start:v_end]
-            salience = contrib.float().mean(dim=(0, 1, 2))   # (V,)
+        for salience in sal_per_layer:
             kept_idx = salience.topk(keep_count).indices
             drop_mask = torch.ones(K_visual, dtype=torch.bool, device=device)
             drop_mask[kept_idx] = False
@@ -192,7 +230,7 @@ def sparse_generate(
         zero_bias = torch.zeros((1, 1, 1, bias_len), device=device, dtype=model_dtype)
         sparse_biases = [zero_bias] * n_layers
 
-    # Save next-token logits before discarding prefill_out (attentions are huge).
+    # Save next-token logits before discarding prefill_out (attentions/hiddens are large).
     first_logits = prefill_out.logits[0, -1, :].detach().clone()
     del prefill_out
 
@@ -276,6 +314,7 @@ def sparse_generate_packed(
     decode_retrieval_ratio: float = 0.0,
     max_new_tokens: int = 80,
     eos_token_id: Optional[int] = None,
+    use_flash_kernel: bool = True,
 ) -> torch.Tensor:
     """Greedy SparseVILA generation with **cache-packing** retrieval.
 
@@ -285,7 +324,8 @@ def sparse_generate_packed(
     positions so attention against them stays numerically faithful.
 
     See module docstring for the trade-off discussion vs the attention-mask
-    variant.
+    variant. ``use_flash_kernel`` controls the salience-computation path
+    (see :func:`sparse_generate`).
     """
     if input_ids.ndim != 2 or input_ids.shape[0] != 1:
         raise NotImplementedError("v1 supports batch_size=1 only")
@@ -311,7 +351,8 @@ def sparse_generate_packed(
         images=images,
         past_key_values=cache,
         use_cache=True,
-        output_attentions=need_retrieval,
+        output_attentions=(need_retrieval and not use_flash_kernel),
+        output_hidden_states=(need_retrieval and use_flash_kernel),
         return_dict=True,
     )
     full_cache = prefill_out.past_key_values
@@ -339,12 +380,13 @@ def sparse_generate_packed(
     K_drop = K_visual - keep_count
     packed_len = full_len - K_drop
 
-    kept_per_layer: List[torch.Tensor] = []
-    for layer_attn in prefill_out.attentions:
-        contrib = layer_attn[:, :, q_start:q_end, v_start:v_end]
-        salience = contrib.float().mean(dim=(0, 1, 2))    # (V,)
-        kept = salience.topk(keep_count).indices.sort().values
-        kept_per_layer.append(kept)
+    sal_per_layer = _compute_decode_salience(
+        model, prefill_out, full_cache, q_start, q_end, v_start, v_end,
+        use_flash_kernel=use_flash_kernel,
+    )
+    kept_per_layer = [
+        sal.topk(keep_count).indices.sort().values for sal in sal_per_layer
+    ]
 
     del prefill_out
 

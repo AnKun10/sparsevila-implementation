@@ -6,6 +6,7 @@ The downstream `prepare_inputs_labels_for_multimodal` will need to be taught
 to consume `pruned_hidden` in place of the regular encoder output (Task 15).
 """
 from __future__ import annotations
+import math
 from dataclasses import dataclass, field
 from typing import Any, List
 import torch
@@ -54,21 +55,55 @@ class _WrappedCLIPTower(nn.Module):
     def forward(self, images: torch.Tensor):
         # The inner LLaVA CLIPVisionTower.forward returns only image_features
         # (a single tensor), so we cannot get attentions from it. Reach into
-        # the underlying HF CLIPVisionModel and request both hidden_states and
-        # attentions, then mimic LLaVA's feature_select so that downstream
-        # behaviour matches the vanilla path when encoder_prune_ratio == 0.
+        # the underlying HF CLIPVisionModel for both hidden_states and the
+        # salience signal, then mimic LLaVA's feature_select for downstream.
         if isinstance(images, list):
             raise NotImplementedError(
                 "List-of-images input is not supported by the SparseVILA wrapper yet"
             )
         vm = self.inner.vision_tower    # HF CLIPVisionModel
-        outs = vm(
-            images.to(device=self.inner.device, dtype=self.inner.dtype),
-            output_hidden_states=True,
-            output_attentions=True,
+        images = images.to(device=self.inner.device, dtype=self.inner.dtype)
+
+        # Decide salience path:
+        #   * flash kernel path (default) requires only output_hidden_states
+        #     and works for the "cls" strategy. We capture the input to the
+        #     selected layer's self_attn via a forward-pre-hook so we can
+        #     re-derive its Q/K cheaply without ever materializing the
+        #     (S+1, S+1) attention matrix.
+        #   * attn-map path (use_flash_kernel=False or non-"cls" strategy)
+        #     falls back to output_attentions=True.
+        use_flash_for_encoder = (
+            self.config.use_flash_kernel
+            and self.config.salience_strategy == "cls"
         )
-        # Hidden states: pick LLaVA's chosen layer (typically -2). Drop CLS for
-        # "patch" feature mode (the LLaVA-1.5 default).
+
+        if use_flash_for_encoder:
+            sal_layer_idx = self.config.salience_layer_idx
+            sal_layer = vm.vision_model.encoder.layers[sal_layer_idx]
+            captured: dict = {}
+
+            def _pre_hook(module, args, kwargs):
+                captured["hidden_states"] = (
+                    args[0] if args else kwargs.get("hidden_states")
+                )
+                return None
+
+            handle = sal_layer.self_attn.register_forward_pre_hook(
+                _pre_hook, with_kwargs=True,
+            )
+            try:
+                outs = vm(images, output_hidden_states=True, output_attentions=False)
+            finally:
+                handle.remove()
+            salience = self._compute_cls_salience_flash(sal_layer, captured["hidden_states"])
+        else:
+            outs = vm(images, output_hidden_states=True, output_attentions=True)
+            attn = outs.attentions[self.config.salience_layer_idx]
+            salience = compute_salience_from_attn(
+                attn, strategy=self.config.salience_strategy,
+            )
+
+        # Hidden states: LLaVA's chosen layer (-2 typically). Drop CLS for "patch".
         hs_full = outs.hidden_states[self.inner.select_layer]
         if self.inner.select_feature == "patch":
             hs_patches = hs_full[:, 1:, :]
@@ -80,12 +115,6 @@ class _WrappedCLIPTower(nn.Module):
             )
         hs_patches = hs_patches.to(images.dtype)
 
-        # Attention for salience: configured layer (default last).
-        attn = outs.attentions[self.config.salience_layer_idx]
-        salience = compute_salience_from_attn(
-            attn, strategy=self.config.salience_strategy,
-        )
-
         pruned, kept_idx = prune_visual_tokens(
             hs_patches, salience, ratio=self.config.encoder_prune_ratio,
         )
@@ -96,6 +125,50 @@ class _WrappedCLIPTower(nn.Module):
         return EncoderSalienceOutput(
             pruned_hidden=pruned, kept_idx=kept_idx, salience=salience,
         )
+
+    @staticmethod
+    def _compute_cls_salience_flash(
+        sal_layer, hidden_states_input: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute CLS-style salience over patches using flash-colreduce.
+
+        Mirrors ``compute_salience_from_attn(attn, strategy="cls")`` exactly:
+
+            attn[..., 0, 1:].mean(dim=1).sum(dim=0)
+
+        where ``attn = softmax(QK^T / sqrt(d))`` includes the CLS column in
+        the denominator. We compute the per-(B, H, S+1) softmax-mean via
+        ``column_salience`` with ``reduction="mean"`` and M=1 (just the CLS
+        row as the only query), then slice patch columns.
+
+        Args:
+            sal_layer: The CLIPEncoderLayer whose self_attn produces the
+                salience signal (usually the last layer).
+            hidden_states_input: The hidden_states tensor that was passed
+                INTO ``sal_layer.self_attn`` (i.e. already passed through
+                ``sal_layer.layer_norm1``).
+        """
+        from ..kernels.salience import column_salience
+
+        attn = sal_layer.self_attn
+        h = hidden_states_input                   # (B, S+1, D_model)
+        B, S1, _ = h.shape
+        H = attn.num_heads
+        D = attn.head_dim
+        q_all = attn.q_proj(h).view(B, S1, H, D).transpose(1, 2)  # (B, H, S+1, D)
+        k_all = attn.k_proj(h).view(B, S1, H, D).transpose(1, 2)  # (B, H, S+1, D)
+        q_cls = q_all[:, :, :1, :].contiguous()                   # (B, H, 1, D)
+
+        # Softmax over the full S+1 keys (CLS + patches), mean over the
+        # single Q row -> the row itself. Match the reference math
+        # (compute_salience_from_attn with strategy="cls").
+        sal_full = column_salience(
+            q_cls, k_all,
+            reduction="mean", is_causal=False, scale=1.0 / math.sqrt(D),
+        )                                                          # (B, H, S+1)
+        sal_patches = sal_full[..., 1:]                            # drop CLS col
+        # Match the reference: mean over heads, sum over batch.
+        return sal_patches.mean(dim=1).sum(dim=0)                  # (S,)
 
 
 class LlavaFifteenAdapter(VLMAdapter):

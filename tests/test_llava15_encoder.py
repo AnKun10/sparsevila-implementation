@@ -67,7 +67,9 @@ class _FakeCLIPTower(torch.nn.Module):
 
 
 def test_wrap_encoder_returns_salience_output():
-    cfg = SparseVILAConfig(encoder_prune_ratio=0.5)
+    # use_flash_kernel=False keeps the attn-map path active so this fake
+    # (which does not implement .vision_model.encoder.layers) is sufficient.
+    cfg = SparseVILAConfig(encoder_prune_ratio=0.5, use_flash_kernel=False)
     adapter = LlavaFifteenAdapter()
     tower = _FakeCLIPTower()
     wrapped = adapter.wrap_encoder(tower, cfg)
@@ -82,7 +84,7 @@ def test_wrap_encoder_returns_salience_output():
 
 
 def test_wrap_encoder_zero_ratio_bypasses():
-    cfg = SparseVILAConfig(encoder_prune_ratio=0.0)
+    cfg = SparseVILAConfig(encoder_prune_ratio=0.0, use_flash_kernel=False)
     adapter = LlavaFifteenAdapter()
     tower = _FakeCLIPTower()
     wrapped = adapter.wrap_encoder(tower, cfg)

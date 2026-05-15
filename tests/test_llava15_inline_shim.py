@@ -47,7 +47,7 @@ class _FakeCLIPTower(torch.nn.Module):
 
 
 def test_wrapped_tower_compat_mode_returns_tensor_when_requested():
-    cfg = SparseVILAConfig(encoder_prune_ratio=0.5)
+    cfg = SparseVILAConfig(encoder_prune_ratio=0.5, use_flash_kernel=False)
     adapter = LlavaFifteenAdapter()
     wrapped = adapter.wrap_encoder(_FakeCLIPTower(), cfg)
     images = torch.randn(1, 3, 16, 16)
@@ -59,7 +59,7 @@ def test_wrapped_tower_compat_mode_returns_tensor_when_requested():
 
 
 def test_wrapped_tower_native_mode_returns_dataclass():
-    cfg = SparseVILAConfig(encoder_prune_ratio=0.5)
+    cfg = SparseVILAConfig(encoder_prune_ratio=0.5, use_flash_kernel=False)
     adapter = LlavaFifteenAdapter()
     wrapped = adapter.wrap_encoder(_FakeCLIPTower(), cfg)
     images = torch.randn(1, 3, 16, 16)
@@ -69,7 +69,7 @@ def test_wrapped_tower_native_mode_returns_dataclass():
 
 
 def test_wrapped_tower_records_last_kept_idx():
-    cfg = SparseVILAConfig(encoder_prune_ratio=0.5)
+    cfg = SparseVILAConfig(encoder_prune_ratio=0.5, use_flash_kernel=False)
     adapter = LlavaFifteenAdapter()
     wrapped = adapter.wrap_encoder(_FakeCLIPTower(), cfg)
     wrapped.compat_mode = True

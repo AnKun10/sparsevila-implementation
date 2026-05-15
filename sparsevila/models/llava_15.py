@@ -152,3 +152,23 @@ class LlavaFifteenAdapter(VLMAdapter):
 
     def build_position_ids(self, sys_len: int, vis_len: int, text_len: int) -> torch.Tensor:
         return build_compressed_position_ids(sys_len, vis_len, text_len)
+
+
+class SparseInferenceSession:
+    """Context manager that wires `packed_kvs` onto the LLM for one generation."""
+
+    def __init__(self, llm: Any, adapter: LlavaFifteenAdapter, ctx: SparseLlavaContext):
+        self.llm = llm
+        self.adapter = adapter
+        self.ctx = ctx
+
+    def __enter__(self):
+        packed = self.adapter.build_packed_kvs(self.ctx)
+        self.llm._sparsevila_ctx = self.ctx
+        self.llm._sparsevila_packed_kvs = packed
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.llm._sparsevila_ctx = None
+        self.llm._sparsevila_packed_kvs = None
+        return False

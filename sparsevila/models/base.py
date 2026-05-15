@@ -17,8 +17,14 @@ class VLMAdapter(ABC):
         """Return the (possibly wrapped) LLM with decode-time retrieval injected."""
 
     @abstractmethod
-    def get_visual_span(self, input_ids: torch.Tensor) -> tuple[int, int]:
-        """Return (v_start, v_end) in the input_ids sequence."""
+    def get_visual_span(
+        self, input_ids: torch.Tensor, kept_visual_count: int,
+    ) -> tuple[int, int]:
+        """Return (v_start, v_end) in the post-multimodal-prep embed sequence.
+
+        ``kept_visual_count`` is the number of visual rows the encoder
+        produced for this image (after any encoder-stage pruning).
+        """
 
     @abstractmethod
     def build_position_ids(

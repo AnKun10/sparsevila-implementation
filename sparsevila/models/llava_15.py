@@ -116,6 +116,8 @@ class LlavaFifteenAdapter(VLMAdapter):
         return llm
 
     def _patch_llama_attention(self, llm: Any, config: SparseVILAConfig) -> None:
+        from ..cache.proxy_cache import PerLayerProxyCache
+
         for layer_idx, layer in enumerate(llm.model.layers):
             attn = layer.self_attn
             original_forward = attn.forward
@@ -127,30 +129,52 @@ class LlavaFifteenAdapter(VLMAdapter):
                     if ctx is None or packed is None:
                         return original(hidden_states, *args, **kwargs)
                     pk = packed[layer_idx]
-                    from transformers.cache_utils import DynamicCache
-                    tmp = DynamicCache()
-                    tmp.key_cache.append(pk.k)
-                    tmp.value_cache.append(pk.v)
+                    # Build a proxy that intercepts update(.., layer_idx=N) and
+                    # routes it to this layer's PackedKV slot regardless of N.
+                    proxy = PerLayerProxyCache(pk.k, pk.v)
                     kwargs = dict(kwargs)
-                    kwargs["past_key_value"] = tmp
-                    return original(hidden_states, *args, **kwargs)
+                    kwargs["past_key_value"] = proxy
+                    out = original(hidden_states, *args, **kwargs)
+                    # Write the proxy's now-extended K/V back so the next
+                    # decode step sees the new token's KV in packed view.
+                    pk.k = proxy.k
+                    pk.v = proxy.v
+                    return out
                 return patched_forward
 
             attn.forward = make_forward()
 
-    def get_visual_span(self, input_ids: torch.Tensor) -> tuple[int, int]:
-        """Find the single contiguous run of IMAGE_TOKEN_INDEX (-200) in input_ids."""
+    def get_visual_span(
+        self, input_ids: torch.Tensor, kept_visual_count: int,
+    ) -> tuple[int, int]:
+        """Locate the visual span in the **post-multimodal-prep** embed sequence.
+
+        LLaVA's ``prepare_inputs_labels_for_multimodal`` replaces the single
+        ``IMAGE_TOKEN_INDEX`` marker in ``input_ids`` with ``kept_visual_count``
+        rows of projected visual features. So the visual span in the embed
+        sequence runs ``[image_pos, image_pos + kept_visual_count)``.
+
+        ``kept_visual_count`` should come from
+        ``model.get_vision_tower().last_kept_idx.numel()`` after a prefill,
+        i.e. after the encoder has computed its pruning decision.
+        """
         IMAGE_TOKEN_INDEX = -200
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise NotImplementedError("v1 supports batch_size=1")
+        if kept_visual_count <= 0:
+            raise ValueError(
+                f"kept_visual_count must be > 0, got {kept_visual_count}"
+            )
         mask = (input_ids[0] == IMAGE_TOKEN_INDEX)
         idxs = mask.nonzero(as_tuple=True)[0]
         if idxs.numel() == 0:
             raise ValueError("No IMAGE_TOKEN_INDEX in input_ids")
         if idxs.numel() != 1:
-            raise NotImplementedError("v1 supports exactly one image marker (one image)")
+            raise NotImplementedError(
+                "v1 supports exactly one image marker (one image)"
+            )
         v_start = int(idxs[0].item())
-        v_end = v_start + 1   # caller expands once K is known
+        v_end = v_start + kept_visual_count
         return (v_start, v_end)
 
     def build_packed_kvs(self, ctx: SparseLlavaContext) -> List[PackedKV]:

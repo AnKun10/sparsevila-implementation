@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+.idea/
+.vscode/
+build/
+dist/
+third_party/LLaVA/   # submodule, not tracked as files
+*.pdf
+*_main.txt
+_sparsevila_*.txt

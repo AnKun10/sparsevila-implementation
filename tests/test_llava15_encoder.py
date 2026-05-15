@@ -44,6 +44,7 @@ def test_wrap_encoder_returns_salience_output():
     tower = _FakeCLIPTower()
     wrapped = adapter.wrap_encoder(tower, cfg)
     images = torch.randn(1, 3, 16, 16)
+    wrapped.compat_mode = False
     out = wrapped(images)
     assert isinstance(out, EncoderSalienceOutput)
     # All 4 patches present in salience score vector
@@ -61,6 +62,7 @@ def test_wrap_encoder_zero_ratio_bypasses():
     tower = _FakeCLIPTower()
     wrapped = adapter.wrap_encoder(tower, cfg)
     images = torch.randn(1, 3, 16, 16)
+    wrapped.compat_mode = False
     out = wrapped(images)
     # No tokens pruned
     assert out.pruned_hidden.shape == (1, 4, 8)

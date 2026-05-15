@@ -43,8 +43,14 @@ class _WrappedCLIPTower(nn.Module):
         super().__init__()
         self.inner = inner
         self.config = config
+        # When True, return a plain tensor for LLaVA compatibility.
+        # The kept_idx is stashed on `self.last_kept_idx` for the LLM-side
+        # wrapper to read when building position_ids and visual_range.
+        self.compat_mode: bool = True
+        self.last_kept_idx: torch.Tensor | None = None
+        self.last_salience: torch.Tensor | None = None
 
-    def forward(self, images: torch.Tensor) -> EncoderSalienceOutput:
+    def forward(self, images: torch.Tensor):
         # Expect inner.forward to return (hidden_states, attn_list)
         hs, attns = self.inner(images)
         # hs:    (B, S+1, D)  — CLS at index 0 for LLaVA-1.5 CLIP
@@ -57,6 +63,10 @@ class _WrappedCLIPTower(nn.Module):
         pruned, kept_idx = prune_visual_tokens(
             patches, salience, ratio=self.config.encoder_prune_ratio
         )
+        self.last_kept_idx = kept_idx
+        self.last_salience = salience
+        if self.compat_mode:
+            return pruned
         return EncoderSalienceOutput(
             pruned_hidden=pruned, kept_idx=kept_idx, salience=salience
         )

@@ -12,3 +12,6 @@ dist/
 *_main.txt
 _sparsevila_*.txt
 .mcp.json
+docs/
+.claude/
+CLAUDE.md

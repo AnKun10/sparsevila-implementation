@@ -8,7 +8,7 @@ venv/
 .vscode/
 build/
 dist/
-third_party/LLaVA/   # submodule, not tracked as files
 *.pdf
 *_main.txt
 _sparsevila_*.txt
+.mcp.json

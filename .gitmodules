@@ -1,3 +1,6 @@
 [submodule "third_party/LLaVA"]
 	path = third_party/LLaVA
 	url = https://github.com/haotian-liu/LLaVA.git
+[submodule "flash-colreduce"]
+	path = flash-colreduce
+	url = https://github.com/z-lab/flash-colreduce.git

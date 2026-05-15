@@ -48,3 +48,13 @@ def test_pruned_hidden_matches_gathered():
     sal = torch.rand(100)
     pruned, idx = prune_visual_tokens(hidden, sal, ratio=0.4)
     assert torch.equal(pruned[:, :, :], hidden[:, idx, :])
+
+
+def test_fp16_salience_supported():
+    # Real LLaVA-1.5 inference produces FP16 salience, but torch.quantile
+    # only accepts float/double. Ensure the pruner handles FP16 gracefully.
+    hidden = torch.randn(1, 100, 16, dtype=torch.float16)
+    sal = torch.rand(100, dtype=torch.float16)
+    pruned, idx = prune_visual_tokens(hidden, sal, ratio=0.5)
+    assert pruned.shape[1] == 50
+    assert pruned.dtype == torch.float16

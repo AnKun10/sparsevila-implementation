@@ -26,7 +26,9 @@ def prune_visual_tokens(
         return hidden_states, torch.arange(salience.shape[0], device=salience.device)
 
     s = salience.shape[0]
-    threshold = salience.quantile(ratio)
+    # torch.quantile only accepts float/double; salience is FP16 under
+    # mixed-precision inference, so cast for the threshold computation.
+    threshold = salience.float().quantile(ratio).to(salience.dtype)
     keep_mask = salience > threshold
     if keep_mask.sum().item() == 0:
         # Degenerate case: all salience ties at the threshold (e.g., all zeros).
